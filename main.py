@@ -1,306 +1,385 @@
-import asyncio
-import logging
-import ssl
-import warnings
-import random
-from datetime import datetime
-from typing import Dict, List, Optional, Set
-
 import requests
-from colorama import Fore, Style, init
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
+import json
+import logging
+import time
+import asyncio
+import telegram
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
+import colorlog
+from colorama import init, Fore, Back, Style
+from fake_useragent import UserAgent
+import urllib3
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+from asyncio import Queue
+import itertools
+import argparse
+import multiprocessing
+from multiprocessing import Pool, Manager 
+import traceback
 
-init(autoreset=True)
-warnings.simplefilter('ignore', InsecureRequestWarning)
-ssl._create_default_https_context = ssl._create_unverified_context
+banner = """
+==================================================================
+ █████╗ ██╗██████╗ ██████╗ ██████╗  ██████╗ ██████╗ 
+██╔══██╗██║██╔══██╗██╔══██╗██╔══██╗██╔═══██╗██╔══██╗
+███████║██║██████╔╝██║  ██║██████╔╝██║   ██║██████╔╝
+██╔══██║██║██╔══██╗██║  ██║██╔══██╗██║   ██║██╔═══╝ 
+██║  ██║██║██║  ██║██████╔╝██║  ██║╚██████╔╝██║     
+╚═╝  ╚═╝╚═╝╚═╝  ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝     
+                                                    
+██╗███╗   ██╗███████╗██╗██████╗ ███████╗██████╗     
+██║████╗  ██║██╔════╝██║██╔══██╗██╔════╝██╔══██╗    
+██║██╔██╗ ██║███████╗██║██║  ██║█████╗  ██████╔╝    
+██║██║╚██╗██║╚════██║██║██║  ██║██╔══╝  ██╔══██╗    
+██║██║ ╚████║███████║██║██████╔╝███████╗██║  ██║    
+╚═╝╚═╝  ╚═══╝╚══════╝╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝    
 
-logging.basicConfig(
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S',
-    level=logging.INFO
+Join our Telegram channel for the latest updates: t.me/airdropinsiderid
+
+DAWN AUTO BOT - Airdrop Insider
+==================================================================
+"""
+print(banner)
+time.sleep(1)
+
+CONFIG_FILE = "config.json"
+PROXY_FILE = "proxies.txt"
+
+parser = argparse.ArgumentParser(description='DAWN AUTO BOT - Airdrop Insider')
+parser.add_argument('-W', '-w', '--worker', type=int, default=3, help='Number of worker threads')
+args = parser.parse_args()
+
+# Setup logging with color
+log_colors = {
+    'DEBUG': 'cyan',
+    'INFO': 'white',
+    'WARNING': 'yellow',
+    'ERROR': 'red',
+    'SUCCESS': 'green'
+}
+
+formatter = colorlog.ColoredFormatter(
+    "%(log_color)s%(asctime)s - %(levelname)s - %(message)s",
+    log_colors=log_colors
 )
 
-class Colors:
-    SUCCESS = f"{Fore.GREEN}"
-    ERROR = f"{Fore.RED}"
-    INFO = f"{Fore.CYAN}"
-    WARNING = f"{Fore.YELLOW}"
-    RESET = f"{Style.RESET_ALL}"
+handler = logging.StreamHandler()
+handler.setFormatter(formatter)
 
-class DawnValidatorBot:
-    API_URLS = {
-        "keepalive": "https://www.aeropres.in/chromeapi/dawn/v1/userreward/keepalive",
-        "getPoints": "https://www.aeropres.in/api/atom/v1/userreferral/getpoint",
-        "socialmedia": "https://www.aeropres.in/chromeapi/dawn/v1/profile/update"
+logger = logging.getLogger()
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# Adding a custom SUCCESS level between INFO and WARNING
+SUCCESS_LEVEL = 25
+logging.addLevelName(SUCCESS_LEVEL, "SUCCESS")
+
+def log_success(message, *args, **kwargs):
+    if logger.isEnabledFor(SUCCESS_LEVEL):
+        logger._log(SUCCESS_LEVEL, message, args, **kwargs)
+
+logging.success = log_success
+
+def read_config(filename=CONFIG_FILE):
+    try:
+        with open(filename, 'r') as file:
+            config = json.load(file)
+        return config
+    except FileNotFoundError:
+        logging.error(f"Configuration file '{filename}' not found.")
+        return {}
+    except json.JSONDecodeError:
+        logging.error(f"Invalid JSON format in '{filename}'.")
+        return {}
+
+def read_proxies(filename=PROXY_FILE):
+    proxies = []
+    try:
+        with open(filename, 'r') as file:
+            for line in file:
+                proxy = line.strip()
+                if proxy:
+                    proxies.append(proxy)
+    except FileNotFoundError:
+        logging.error(f"Proxy file '{filename}' not found.")
+    return proxies
+
+def parse_proxy(proxy):
+    """Parse proxy string into format for requests."""
+    proxy_url = urlparse(proxy)
+    if proxy_url.scheme in ['http', 'https', 'socks5']:
+        if proxy_url.username and proxy_url.password:
+            return {
+                'http': f"{proxy_url.scheme}://{proxy_url.username}:{proxy_url.password}@{proxy_url.hostname}:{proxy_url.port}",
+                'https': f"{proxy_url.scheme}://{proxy_url.username}:{proxy_url.password}@{proxy_url.hostname}:{proxy_url.port}",
+            }
+        else:
+            return {
+                'http': f"{proxy_url.scheme}://{proxy_url.hostname}:{proxy_url.port}",
+                'https': f"{proxy_url.scheme}://{proxy_url.hostname}:{proxy_url.port}",
+            }
+    return {}
+
+def check_proxy(proxy):
+    """Check if the proxy is active without logging."""
+    proxies = parse_proxy(proxy)
+    test_url = "http://httpbin.org/ip"
+    
+    try:
+        response = requests.get(test_url, proxies=proxies, timeout=5)
+        return response.status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def get_active_proxies(required=10):
+    """Check all proxies and return a list of active proxies using multithreading."""
+    proxies = read_proxies(PROXY_FILE)
+    active_proxies = []
+
+    # Create a ThreadPoolExecutor to run proxy checks concurrently
+    # with ThreadPoolExecutor(max_workers=200) as executor:  # You can adjust max_workers to control the level of concurrency
+    #     futures = [executor.submit(check_proxy, proxy) for proxy in proxies]
+        
+        # Collect results as they complete
+    # for future, proxy in zip(futures, proxies):
+        # if future.result():
+        #  active_proxies.append(proxy)
+    
+    if proxies:
+        logging.success(f"Found {len(proxies)} active proxies.")
+        return proxies
+    else:
+        logging.error("No active proxies found.")
+        return []
+
+def update_proxies_file(active_proxies):
+    """Update proxies.txt file with only active proxies."""
+    with open(PROXY_FILE, 'w') as file:
+        for proxy in active_proxies:
+            file.write(f"{proxy}\n")
+    logging.success(f"Updated {PROXY_FILE} with {len(active_proxies)} active proxies.")
+
+def create_session(proxy=None):
+    session = requests.Session()
+    session.mount('http://', HTTPAdapter(pool_connections=10, pool_maxsize=10))
+    session.mount('https://', HTTPAdapter(pool_connections=10, pool_maxsize=10))
+    if proxy:
+        proxies = parse_proxy(proxy)
+        logging.info(f"Using proxy: {proxy}")
+        session.proxies.update(proxies)
+    return session
+
+config = read_config(CONFIG_FILE)
+bot_token = config.get("telegram_bot_token")
+chat_id = config.get("telegram_chat_id")
+use_proxy = config.get("use_proxy", False)
+use_telegram = config.get("use_telegram", False)
+poll_interval = config.get("poll_interval", 120)  # Default to 120 seconds
+
+if use_telegram and (not bot_token or not chat_id):
+    logging.error("Missing 'bot_token' or 'chat_id' in 'config.json'.")
+    exit(1)
+
+bot = telegram.Bot(token=bot_token) if use_telegram else None
+keepalive_url = "https://www.aeropres.in/chromeapi/dawn/v1/userreward/keepalive"
+get_points_url = "https://www.aeropres.in/api/atom/v1/userreferral/getpoint"
+extension_id = "fpdkjdnhkakefebpekbdhillbhonfjjp"
+_v = "1.1.1"
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+ua = UserAgent()
+
+def read_account(filename="config.json"):
+    try:
+        with open(filename, 'r') as file:
+            data = json.load(file)
+            accounts = data.get("accounts", [])
+            return accounts 
+    except FileNotFoundError:
+        logging.error(f"Config file '{filename}' not found.")
+        return []
+    except json.JSONDecodeError:
+        logging.error(f"Invalid JSON format in '{filename}'.")
+        return []
+
+def total_points(headers,appid, session):
+    try:
+        response = session.get(get_points_url+"?appid="+appid, headers=headers, verify=False)
+        response.raise_for_status()
+
+        json_response = response.json()
+        if json_response.get("status"):
+            reward_point_data = json_response["data"]["rewardPoint"]
+            referral_point_data = json_response["data"]["referralPoint"]
+            total_points = (
+                reward_point_data.get("points", 0) +
+                reward_point_data.get("registerpoints", 0) +
+                reward_point_data.get("signinpoints", 0) +
+                reward_point_data.get("twitter_x_id_points", 0) +
+                reward_point_data.get("discordid_points", 0) +
+                reward_point_data.get("telegramid_points", 0) +
+                reward_point_data.get("bonus_points", 0) +
+                referral_point_data.get("commission", 0)
+            )
+            return total_points
+        else:
+            logging.warning(f"Warning: {json_response.get('message', 'Unknown error when fetching points')}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error fetching points: {e}")
+    return 0
+
+def keep_alive(headers, email,appid, session):
+    keepalive_payload = {
+        "username": email,
+        "extensionid": extension_id,
+        "numberoftabs": 0,
+        "_v": _v
     }
 
-    EXTENSION_ID = "fpdkjdnhkakefebpekbdhillbhonfjjp"
-    VERSION = "1.0.9"
-
-    def __init__(self):
-        self.verified_accounts: Set[str] = set()
-        self.session = requests.Session()
-        self.session.verify = False
-        self.proxies: List[str] = []
-
-    def get_base_headers(self, token: str) -> Dict[str, str]:
-        return {
-            "Accept": "*/*",
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Origin": f"chrome-extension://{self.EXTENSION_ID}",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-        }
-
-    @staticmethod
-    def log_colored(level: str, message: str, color: str) -> None:
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        print(f"[{timestamp}] {color}{level}: {message}{Colors.RESET}")
-
-    def get_random_proxy(self) -> Optional[str]:
-        return random.choice(self.proxies) if self.proxies else None
-
-    async def fetch_points(self, headers: Dict[str, str]) -> int:
-        try:
-            response = self.session.get(
-                f"{self.API_URLS['getPoints']}?appid=undefined",
-                headers=headers
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            if not data.get('status'):
-                raise ValueError(data.get('message', 'Unknown error'))
-
-            points_data = data.get('data', {})
-            reward = points_data.get('rewardPoint', {})
-            referral = points_data.get('referralPoint', {})
-            
-            total = sum([
-                reward.get('points', 0),
-                reward.get('registerpoints', 0),
-                reward.get('signinpoints', 0),
-                reward.get('twitter_x_id_points', 0),
-                reward.get('discordid_points', 0),
-                reward.get('telegramid_points', 0),
-                reward.get('bonus_points', 0),
-                referral.get('commission', 0)
-            ])
-            return total
-
-        except Exception as e:
-            self.log_colored("ERROR", f"Failed to fetch points: {str(e)}", Colors.ERROR)
-            return 0
-
-    async def keep_alive_request(self, headers: Dict[str, str], email: str) -> bool:
-        payload = {
-            "username": email,
-            "extensionid": self.EXTENSION_ID,
-            "numberoftabs": 0,
-            "_v": self.VERSION
-        }
-        
-        try:
-            response = self.session.post(
-                f"{self.API_URLS['keepalive']}?appid=undefined",
-                json=payload,
-                headers=headers
-            )
-            response.raise_for_status()
-            return True
-        except Exception as e:
-            self.log_colored("ERROR", f"Keep-alive failed for {email}: {str(e)}", Colors.ERROR)
-            return False
-
-    async def verify_social_media(self, account: Dict[str, str], proxy: Optional[str] = None) -> None:
-        email = account['email']
-        
-        if email in self.verified_accounts:
-            return
-            
-        headers = self.get_base_headers(account['token'])
-        if proxy:
-            headers['Proxy'] = proxy
-
-        social_types = ["twitter_x_id", "discordid", "telegramid"]
-        
-        self.log_colored("INFO", f"Starting social media verification for {email}", Colors.INFO)
-        
-        for social_type in social_types:
-            try:
-                response = self.session.post(
-                    f"{self.API_URLS['socialmedia']}?appid=undefined",
-                    json={social_type: social_type},
-                    headers=headers,
-                    timeout=60
-                )
-                response.raise_for_status()
-                
-                result = response.json()
-                if result.get('success'):
-                    self.log_colored("SUCCESS", f"Verified {social_type} for {email}", Colors.SUCCESS)
-                else:
-                    self.log_colored("ERROR", f"Failed to verify {social_type} for {email}: {result.get('message')}", Colors.ERROR)
-                
-            except Exception as e:
-                self.log_colored("ERROR", f"Error verifying {social_type} for {email}: {str(e)}", Colors.ERROR)
-            
-            await asyncio.sleep(90)
-        
-        self.log_colored("INFO", f"Completed social media verification for {email}", Colors.INFO)
-        self.verified_accounts.add(email)
-
-    @staticmethod
-    def load_accounts(mode: str) -> List[Dict[str, str]]:
-        if mode == "1":
-            return DawnValidatorBot._get_single_account()
-        return DawnValidatorBot._load_accounts_from_file()
-
-    @staticmethod
-    def _get_single_account() -> List[Dict[str, str]]:
-        print(f"{Colors.INFO}Please enter account details{Colors.RESET}")
-        
-        while True:
-            email = input(f"{Colors.INFO}Enter email: {Colors.RESET}").strip()
-            if not email:
-                print(f"{Colors.ERROR}ERROR: Email cannot be empty{Colors.RESET}")
-                continue
-            
-            token = input(f"{Colors.INFO}Enter token: {Colors.RESET}").strip()
-            if not token:
-                print(f"{Colors.ERROR}ERROR: Token cannot be empty{Colors.RESET}")
-                continue
-                
-            print(f"{Colors.SUCCESS}SUCCESS: Account details received{Colors.RESET}")
-            return [{'email': email, 'token': token}]
-
-    @staticmethod
-    def _load_accounts_from_file() -> List[Dict[str, str]]:
-        try:
-            accounts = []
-            with open('accounts.txt', 'r') as f:
-                for line in f:
-                    if ':' not in line:
-                        continue
-                
-                    email, token = line.strip().split(':')
-                    if email and token:
-                        accounts.append({
-                            'email': email.strip(),
-                            'token': token.strip()
-                        })
-        
-            if not accounts:
-                raise ValueError("No valid accounts found in accounts.txt")
-        
-            DawnValidatorBot.log_colored("SUCCESS", f"Loaded {len(accounts)} accounts from accounts.txt", Colors.SUCCESS)
-            return accounts
-        
-        except FileNotFoundError:
-            DawnValidatorBot.log_colored("WARNING", "accounts.txt not found", Colors.WARNING)
-            return []
-        except Exception as e:
-            DawnValidatorBot.log_colored("ERROR", f"Error loading accounts from accounts.txt: {str(e)}", Colors.ERROR)
-            return []
-
-    def load_proxies(self) -> None:
-        try:
-            with open('proxies.txt', 'r') as f:
-                self.proxies = [line.strip() for line in f if line.strip()]
-                
-            if self.proxies:
-                self.log_colored("SUCCESS", f"Loaded {len(self.proxies)} proxies", Colors.SUCCESS)
-            else:
-                self.log_colored("WARNING", "No proxies found in proxies.txt", Colors.WARNING)
-                
-        except FileNotFoundError:
-            self.log_colored("WARNING", "proxies.txt not found. Running without proxies.", Colors.WARNING)
-
-    @staticmethod
-    def display_welcome() -> None:
-        print(f"""
-{Colors.INFO}{Style.BRIGHT}╔══════════════════════════════════════════════╗
-║            Dawn Validator AutoBot            ║
-║     Github: https://github.com/IM-Hanzou     ║
-║      Welcome and do with your own risk!      ║
-╚══════════════════════════════════════════════╝{Colors.RESET}
-""")
-
-    async def process_account(self, account: Dict[str, str]) -> int:
-        
-        email = account['email']
-        proxy = self.get_random_proxy() 
-        headers = self.get_base_headers(account['token'])
-        
-        if proxy:
-            headers['Proxy'] = proxy
-
-        self.log_colored("INFO", f"Processing account: {email}", Colors.INFO)
-        self.log_colored("INFO", f"Using proxy: {proxy or 'No Proxy'}", Colors.INFO)
-
-        points = await self.fetch_points(headers)
-        self.log_colored("INFO", f"Current points: {points}", Colors.WARNING)
-
-        await self.verify_social_media(account, proxy)
-        await self.keep_alive_request(headers, email)
-
-        return points
-
-    @staticmethod
-    async def countdown(seconds: int) -> None:
-        for remaining in range(seconds, 0, -1):
-            print(f"\r[{datetime.now().strftime('%H:%M:%S')}] {Colors.WARNING}Waiting: {remaining}s{Colors.RESET}", end='')
-            await asyncio.sleep(1)
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {Colors.SUCCESS}Restarting process{Colors.RESET}\n")
-
-async def main():
-    bot = DawnValidatorBot()
-    bot.display_welcome()
-    
-    print(f"{Colors.INFO}Select mode:{Colors.RESET}")
-    print("1. Single Account")
-    print("2. Multiple Accounts [from accounts.txt]")
-    
-    while True:
-        mode = input(f"{Colors.WARNING}Enter choice (1/2): {Colors.RESET}")
-        if mode in ['1', '2']:
-            break
-        print(f"{Colors.ERROR}ERROR: Invalid choice. Please enter 1 or 2.{Colors.RESET}")
-    
-    accounts = bot.load_accounts(mode)
-    if not accounts:
-        bot.log_colored("ERROR", "No accounts available. Exiting...", Colors.ERROR)
-        return
-
-    bot.load_proxies()
+    headers["User-Agent"] = ua.random
 
     try:
-        while True:
-            bot.log_colored("INFO", "Starting new process", Colors.INFO)
-            
-            account_tasks = []
-            for account in accounts:
-                account_tasks.append(bot.process_account(account))
+        response = session.post(keepalive_url+"?appid="+appid, headers=headers, json=keepalive_payload, verify=False)
+        response.raise_for_status()
 
-            points_array = await asyncio.gather(*account_tasks)
-            
-            for i, points in enumerate(points_array):
-                if isinstance(points, dict):
-                    total_points = points.get('total', 0)
-                else:
-                    total_points = points
-                    
-                bot.log_colored("INFO", f"Account {accounts[i]['email']} accumulated: {total_points} points", Colors.WARNING)
-            
-            bot.log_colored("INFO", "Process completed", Colors.SUCCESS)
-            bot.log_colored("INFO", f"Total accounts processed: {len(accounts)}", Colors.INFO)
-            
-            await bot.countdown(250)
+        json_response = response.json()
+        if 'message' in json_response:
+            return True, json_response['message']
+        else:
+            return False, "Message not found in response"
+    except requests.exceptions.RequestException as e:
+        return False, str(e)
 
-    except KeyboardInterrupt:
-        bot.log_colored("WARNING", "Process interrupted by user. Exiting...", Colors.WARNING)
-    except Exception as e:
-        bot.log_colored("ERROR", f"Fatal error occurred: {str(e)}", Colors.ERROR)
+# Queue for Telegram messages
+message_queue = Queue()
+
+async def telegram_worker():
+    while True:
+        message = await message_queue.get()
+        await telegram_message(message)
+        message_queue.task_done()
+
+async def queue_telegram_message(message):
+    await message_queue.put(message)
+
+async def telegram_message(message):
+    if use_telegram:
+        try:
+            await bot.send_message(chat_id=chat_id, text=message, parse_mode="Markdown")
+            await asyncio.sleep(1)  # Delay of 1 second after sending the message
+        except Exception as e:
+            logging.error(f"Error sending Telegram message: {e}")
+
+def process_account(account,proxy):
+    email = account["email"]
+    token = account["token"]
+    appid = account["appid"]
+    # proxy = account["proxy"]
+
+    logging.info(f"appid:{appid},proxy:{proxy}")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": ua.random
+    }
+
+    session = None  # Inisialisasi session di luar loop
+    
+    try:
+        if session:
+            session.close()  # Tutup session sebelumnya jika ada
+        session = create_session(proxy)
+
+        success, status_message = keep_alive(headers, email, appid,session)
+
+        if success:
+            points = total_points(headers, appid,session)
+            message = (
+                "✅ *🌟 Success Notification 🌟* ✅\n\n"
+                f"👤 *Account:* {email}\n\n"
+                f"💰 *Points Earned:* {points}\n\n"
+                f"📢 *Message:* {status_message}\n\n"
+                f"🛠️ *Proxy Used:* {proxy}\n\n"
+                "🤖 *Bot made by https://t.me/AirdropInsiderID*"
+            )
+            logging.success(f"Success keep alive for {email} with proxy {proxy}. Reason: {status_message} message:{message}")
+            return email, True, message
+        else:
+            logging.error(f"Failed keep alive for {email} with proxy {proxy}. Reason: {status_message}")
+        
+        # Jika semua proxy gagal
+        message = (
+            "⚠️ *Failure Notification* ⚠️\n\n"
+            f"👤 *Account:* {email}\n\n"
+            "❌ *Status:* Keep Alive Failed for All Proxies\n\n"
+            "⚙️ *Action Required:* Please check proxy list or account status.\n\n"
+            "🤖 *Bot made by https://t.me/AirdropInsiderID*"
+        )
+        return email, False, message
+    finally:
+        if session:
+            session.close()  # Pastikan session ditutup
+def assign_proxies_to_accounts(accounts, proxies):
+    if len(proxies) < len(accounts):
+        logging.error("Not enough proxies for all accounts. Please add more proxies.")
+        exit(1)
+
+    # 将代理循环分配给账户（或选择其他分配策略）
+       # 将代理循环分配给账户
+    for i, account in enumerate(accounts):
+        account["proxy"] = proxies[i % len(proxies)]
+    return accounts
+
+
+async def main():
+    accounts = read_account()
+    active_proxies = get_active_proxies(len(accounts))
+    update_proxies_file(active_proxies)
+    accounts = assign_proxies_to_accounts(accounts, active_proxies)
+    # Start the Telegram message worker
+    telegram_task = asyncio.create_task(telegram_worker())
+
+    while True:
+        pool = None
+        try:
+            # Buat pool untuk memproses akun secara parallel
+            pool = Pool(processes=args.worker)
+            
+            
+            # Siapkan parameter untuk setiap akun
+            process_params = [(account,account['proxy']) for account in accounts]
+            
+            logging.info(f"{process_params}")
+            # Proses akun secara parallel
+            results = pool.starmap(process_account,process_params)
+
+            # Kirim pesan Telegram untuk setiap hasil
+            for email, success, message in results:
+                await queue_telegram_message(message)
+                logging.info(f"Account {email} completed with status: {'success' if success else 'failed'}")
+
+            logging.info(f"All accounts processed. Waiting {poll_interval} seconds before next cycle.")
+            await asyncio.sleep(poll_interval)
+
+        except Exception as e:
+            logging.error(f"Error in main loop: {e}")
+            logging.Error(traceback.format_exc())
+
+            await asyncio.sleep(10)
+        finally:
+            if pool:
+                pool.close()
+                pool.join()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        multiprocessing.freeze_support()
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Script stopped by user.")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
+    finally:
+        logging.info("Cleaning up resources...")
